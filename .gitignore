@@ -1,0 +1,16 @@
+dumps
+*.log
+*.tt
+.DS_Store
+test.py
+__pycache__
+Unicorn_Trace.zip
+tmp
+plans
+dump
+.vscode/settings.json
+SKILL.md
+test_api.py
+trace_slice_tenet.py
+trace.zip
+dist
