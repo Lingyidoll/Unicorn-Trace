@@ -398,11 +398,15 @@ class Arm64Emulator:
         code = self.mu.mem_read(address, 4)
         if code == b"\xBF\x23\x03\xD5":  # handle autiasp
             raise UcError(0, "Except AUTIASP")
-
+        # svc
         code = self.mu.mem_read(address, 4)
         if code == b"\x01\x00\x00\xD4":  # handle autiasp
             raise UcError(0, "Except AUTIASP")
-        
+        # mrs
+        code_ins = bytes(code)
+        if code_ins[1] == 0xD0 and code_ins[2] == 0x3B and code_ins[3] == 0xD5 and (code_ins[0] & 0xE0) == 0x40:
+            print("识别到mrs指令")
+            raise UcError(0, "Except AUTIASP")
         # 处理寄存器值修正
         self._fix_register_values()
         

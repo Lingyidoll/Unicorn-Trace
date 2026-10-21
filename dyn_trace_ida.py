@@ -13,7 +13,7 @@ import ida_bytes
 import idaapi
 import ida_dbg
 import ida_kernwin
-from unicorn_trace.unicorn_class import Arm64Emulator # type: ignore
+from unicorn_trace.unicorn_class import Arm64Emulator  # type: ignore
 
 try:
     import PySide6.QtWidgets as QtWidgets
@@ -42,6 +42,7 @@ DUMP_SINGLE_SEG_SIZE = 0x4000
 ROUND_MAX = 1000
 PANEL_TITLE = "Unicorn ARM64 Tracer"
 LOG_MAX_BLOCKS = 2000
+
 
 # ==============================
 # 插件表单类
@@ -236,11 +237,12 @@ class UnicornTracerDialog(QtWidgets.QDialog):
             grid.addWidget(edit, row, 1)
             self._widgets[key] = edit
 
-        add_row(0, "END addr (hex, default relative to base):", "end_addr", "0x0")
-        add_row(1, "TPIDR (hex, optional):", "tpidr_value", "")
-        add_row(2, "Bound start (hex):", "bound_start", "0x0")
-        add_row(3, "Bound end (hex):", "bound_end", "0x0")
-        add_row(4, "Output path:", "output_path", ".")
+        add_row(0, "BASE addr(hex,optional):", "base_addr", '0x0')
+        add_row(1, "END addr (hex, default relative to base):", "end_addr", "0x0")
+        add_row(2, "TPIDR (hex, optional):", "tpidr_value", "")
+        add_row(3, "Bound start (hex):", "bound_start", "0x0")
+        add_row(4, "Bound end (hex):", "bound_end", "0x0")
+        add_row(5, "Output path:", "output_path", ".")
 
         layout.addLayout(grid)
 
@@ -367,7 +369,17 @@ class UnicornTracerDialog(QtWidgets.QDialog):
 
     def _refresh_auto_range(self, update_bounds=False):
         image_base = idaapi.get_imagebase()
-        self._widgets["base_label"].setText(f"Image Base: {hex(image_base)}")
+        base_text = self._widgets["base_addr"].text().strip()
+        try:
+            base_val = int(base_text, 0) if base_text else 0
+        except ValueError:
+            base_val = 0
+        if base_val == 0:
+            effective_base = image_base
+            self._widgets["base_addr"].setText(hex(image_base))
+        else:
+            effective_base = base_val
+        self._widgets["base_label"].setText(f"Image Base: {hex(effective_base)}")
         self.auto_base, self.auto_end = _collect_auto_range()
         self._widgets["auto_range_label"].setText(
             f"Auto Range (from current PC exec segment): {hex(self.auto_base)} - {hex(self.auto_end)}"
@@ -405,6 +417,8 @@ class UnicornTracerDialog(QtWidgets.QDialog):
             self._set_status(tip)
 
     def _collect_form_values(self):
+        base_addr = _parse_addr(self._widgets["base_addr"].text(), "base addr")
+        print(hex(base_addr))
         end_addr_input = _parse_addr(self._widgets["end_addr"].text(), "END addr")
         tpidr_raw = self._widgets["tpidr_value"].text().strip()
         tpidr_value = _parse_addr(tpidr_raw, "TPIDR", allow_empty=True)
@@ -420,6 +434,7 @@ class UnicornTracerDialog(QtWidgets.QDialog):
             raise ValueError("Bound start 必须小于 Bound end")
 
         return {
+            "base_addr": base_addr,
             "end_addr": hex(end_addr_input),
             "tpidr_value": "" if tpidr_value is None else hex(tpidr_value),
             "bound_start": hex(bound_start),
@@ -455,7 +470,7 @@ class UnicornTracerDialog(QtWidgets.QDialog):
 
         self._start_log_capture()
         print("[+] 配置参数:")
-        print(f"基地址: {hex(idaapi.get_imagebase())}")
+        print(f"基地址: {hex(config['base_addr'])}")
         print(f"自动范围: {hex(self.auto_base)} - {hex(self.auto_end)}")
         print(f"结束地址输入: {config['end_addr']} ({'absolute' if config['end_addr_absolute'] else 'relative'})")
         if config["_raw_tpidr_value"] is not None:
@@ -471,6 +486,7 @@ class UnicornTracerDialog(QtWidgets.QDialog):
 
         try:
             result = uni_trace_main(
+                base_addr=config["base_addr"],
                 endaddr_input=config["_raw_end_addr"],
                 tpidr_value_input=config["_raw_tpidr_value"],
                 enable_tenet=config["enable_tenet"],
@@ -513,13 +529,14 @@ class UnicornTracerDialog(QtWidgets.QDialog):
             self._stop_log_capture()
             QtWidgets.QApplication.processEvents()
 
+
 # ==============================
 # 插件主类
 # ==============================
 
 class UnicornEmulatorPlugin(idaapi.plugin_t):
     """Unicorn ARM64模拟器插件"""
-    
+
     flags = idaapi.PLUGIN_KEEP
     comment = "ARM64 Unicorn Tracer"
     help = "使用Unicorn引擎模拟ARM64代码执行"
@@ -582,6 +599,7 @@ class UnicornEmulatorPlugin(idaapi.plugin_t):
         except Exception as e:
             print(f"[!] 保存缓存失败: {e}")
 
+
 # ==============================
 # 插件注册
 # ==============================
@@ -590,12 +608,14 @@ def PLUGIN_ENTRY():
     """插件入口点"""
     return UnicornEmulatorPlugin()
 
+
 # ==============================
 # 原有的IDA集成ARM64模拟器类（保持不变）
 # ==============================
 
 class IDAArm64Emulator(Arm64Emulator):
     """IDA集成的ARM64模拟器，继承自Arm64Emulator基类"""
+
     def remove_last_line_efficient(self, filename):
         try:
             with open(filename, 'r', encoding='utf-8') as f:
@@ -606,14 +626,14 @@ class IDAArm64Emulator(Arm64Emulator):
                     f.writelines(lines)
         except Exception as e:
             return
-    
+
     def init_log_files(self, tenet_log_path, user_log_path):
         """初始化日志文件"""
         if tenet_log_path:
             # self.remove_last_line_efficient(tenet_log_path)
             self.trace_log = open(tenet_log_path, "a")
             # self.trace_log.write("\n")
-        
+
         if user_log_path:
             # self.remove_last_line_efficient(user_log_path)
             self.log_file = open(user_log_path, "a")
@@ -640,10 +660,7 @@ class IDAArm64Emulator(Arm64Emulator):
 
     def _check_mrs_tpidr(self, address):
         """检测 mrs Xn, tpidr_el0 指令，通过IDA run_to执行后从目标寄存器读取tpidr值"""
-        if self._tpidr_auto_detected or self.tpidr_value is not None:
-            return
         code = bytes(self.mu.mem_read(address, 4))
-        # mrs Xn, tpidr_el0: little-endian [0x40|Rn, 0xD0, 0x3B, 0xD5]
         if code[1] == 0xD0 and code[2] == 0x3B and code[3] == 0xD5 and (code[0] & 0xE0) == 0x40:
             dest_reg = code[0] & 0x1F
             print(f"[+] 自动检测到 mrs x{dest_reg}, tpidr_el0 @ 0x{address:x}")
@@ -676,15 +693,13 @@ class IDAArm64Emulator(Arm64Emulator):
                     print(f"[!] 回写 tpidr 到 regs.json 失败: {e}")
 
     def debug_hook_code(self, uc, address, size, user_data):
-        """重写：增加 mrs tpidr_el0 自动检测"""
-        self._check_mrs_tpidr(address)
         super().debug_hook_code(uc, address, size, user_data)
 
     def load_memory_mappings(self, load_dumps_path):
         """重写：加载内存映射，集成IDA段信息"""
         mem_list = os.listdir(load_dumps_path)
         map_list = []
-        
+
         # 解析内存映射文件
         for filename in mem_list:
             pattern = r'0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)\.bin$'
@@ -740,13 +755,14 @@ class IDAArm64Emulator(Arm64Emulator):
 
             if mem_end > lower_bound:
                 mem_end = lower_bound
-            
+
             mem_size = mem_end - mem_base
 
             # if mem_size <= 0:
             #     mem_size = 0x1000            
             if mem_size <= 0:
-                self.log(f"continue: map file {filename} {hex(mem_base)} {hex(mem_end)} {hex(mem_size)}, bound ({hex(upper_bound)} - {hex(lower_bound)})")
+                self.log(
+                    f"continue: map file {filename} {hex(mem_base)} {hex(mem_end)} {hex(mem_size)}, bound ({hex(upper_bound)} - {hex(lower_bound)})")
                 continue
 
             elif mem_size & 0xfff != 0:
@@ -754,7 +770,8 @@ class IDAArm64Emulator(Arm64Emulator):
 
             mem_end = mem_base + mem_size
 
-            self.log(f"map file {filename} {hex(mem_base)} {hex(mem_end)} {hex(mem_size)}, bound ({hex(upper_bound)} - {hex(lower_bound)})")
+            self.log(
+                f"map file {filename} {hex(mem_base)} {hex(mem_end)} {hex(mem_size)}, bound ({hex(upper_bound)} - {hex(lower_bound)})")
             self.mu.mem_map(mem_base, mem_size)
             self.map_range.append((mem_base, mem_end))
 
@@ -767,15 +784,15 @@ class IDAArm64Emulator(Arm64Emulator):
 
     def main_trace(self, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps"):
         """重写：主要模拟函数，集成IDA错误处理"""
-        try:        
+        try:
             # 初始化日志文件
             self.init_log_files(tenet_log_path, user_log_path)
-            
+
             if self.loaded_files == []:
 
                 # 加载寄存器状态
                 self.load_registers(os.path.join(load_dumps_path, "regs.json"))
-                print("Registers loaded.")  
+                print("Registers loaded.")
 
                 # 重置寄存器跟踪
                 self.last_registers.clear()
@@ -796,11 +813,10 @@ class IDAArm64Emulator(Arm64Emulator):
                 return 5
             # 开始模拟
             self.mu.emu_start(start_addr, end_addr)
-
         except UcError as e:
             return self._handle_uc_error(e)
         except Exception as e:
-            print(f"发生未知错误: {e}")    
+            print(f"发生未知错误: {e}")
             self.my_reg_logger()
             return 0
         finally:
@@ -810,7 +826,7 @@ class IDAArm64Emulator(Arm64Emulator):
                 self.log_file.close()
             if self.trace_log:
                 self.trace_log.close()
-        
+
         return 114514
 
     def _handle_uc_error(self, e):
@@ -827,15 +843,15 @@ class IDAArm64Emulator(Arm64Emulator):
 
         if "UC_ERR_EXCEPTION" in err_str:
             return self._handle_exception_error()
-            
+
         if self.last_regs == self.dump_registers():
             print(f"[!] Stop at the same location. Jump out. Maybe Check MRS opcode and TPIDR regs")
             return 0
-        
+
         if any(err in err_str for err in ["UC_ERR_READ_UNMAPPED", "UC_ERR_FETCH_UNMAPPED", "UC_ERR_WRITE_UNMAPPED"]):
             self.last_regs = self.dump_registers()
             return 2
-        
+
         return 0
 
     def _handle_out_of_range_error(self):
@@ -843,8 +859,8 @@ class IDAArm64Emulator(Arm64Emulator):
         if self.check_registers():
             print('[!] Check REGs Wrong')
             exit(0)
-
-        print(f"[+] Run to 0x{self.mu.reg_read(self.REG_MAP['lr']):x} for further run, PC: 0x{self.mu.reg_read(self.REG_MAP['pc']):x} ")
+        print(
+            f"[+] Run to 0x{self.mu.reg_read(self.REG_MAP['lr']):x} for further run, PC: 0x{self.mu.reg_read(self.REG_MAP['pc']):x} ")
         ida_dbg.run_to(self.mu.reg_read(self.REG_MAP['lr']))
         print("[+] Waiting Ida...")
         ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
@@ -857,7 +873,8 @@ class IDAArm64Emulator(Arm64Emulator):
             print('[!] Check REGs Wrong')
             exit(0)
 
-        print(f"[+] Run to 0x{self.mu.reg_read(self.REG_MAP['pc']) + 4:x} for further run, PC: 0x{self.mu.reg_read(self.REG_MAP['pc']):x} ")
+        print(
+            f"[+] Run to 0x{self.mu.reg_read(self.REG_MAP['pc']) + 4:x} for further run, PC: 0x{self.mu.reg_read(self.REG_MAP['pc']):x} ")
         ida_dbg.run_to(self.mu.reg_read(self.REG_MAP['pc']) + 4)
         print("[+] Waiting Ida...")
         ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
@@ -869,7 +886,7 @@ class IDAArm64Emulator(Arm64Emulator):
         if self.check_registers():
             print('[!] Check REGs Wrong')
             exit(0)
-        
+
         ida_dbg.run_to(self.mu.reg_read(self.REG_MAP['lr']))
         print("[+] Waiting Ida...")
         ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
@@ -887,24 +904,24 @@ class IDAArm64Emulator(Arm64Emulator):
             if seg_size <= 0:
                 print(f"[-] Invalid segment size: {seg_size}")
                 return False
-            
+
             if seg_size > 0x4000000:
                 print(f"[!] Too big segment size: {seg_size}")
                 seg_size = 0x4000000
-            
+
             segment_data = ida_bytes.get_bytes(seg_start, seg_size)
             if not segment_data:
                 print(f"[-] Failed to read segment data from {hex(seg_start)} to {hex(seg_end)}")
                 return False
-            
+
             with open(filename, 'wb') as f:
                 f.write(segment_data)
-            
+
             print(f"[+] Successfully dumped segment to: {filename}")
             print(f"[+] Segment range: {hex(seg_start)} - {hex(seg_end)}")
             print(f"[+] Dumped size: {len(segment_data)} bytes ({hex(len(segment_data))})")
             return True
-            
+
         except Exception as e:
             print(f"[-] Error during dump: {str(e)}")
             return False
@@ -919,21 +936,22 @@ class IDAArm64Emulator(Arm64Emulator):
         except ValueError:
             print(f"[-] Invalid address format: {target_addr}")
             return None
-        
+
         for i in range(ida_segment.get_segm_qty()):
             seg = ida_segment.getnseg(i)
             if seg and seg.start_ea <= addr_val < seg.end_ea:
                 return seg
-        
+
         print(f"[-] No segment found containing address: {hex(addr_val)}")
         return None
 
-    def dump_single_segment_address(self, input_addr, range_size=0x10000, file_dump_path="./dumps", next_dump_flag=False):
+    def dump_single_segment_address(self, input_addr, range_size=0x10000, file_dump_path="./dumps",
+                                    next_dump_flag=False):
         """转储单个段地址"""
         if not input_addr:
             print("[-] No address provided")
             return
-        
+
         if isinstance(input_addr, str):
             target_addr = int(input_addr[2:], 16) if input_addr.startswith('0x') else int(input_addr)
         else:
@@ -942,12 +960,12 @@ class IDAArm64Emulator(Arm64Emulator):
         # 处理特殊地址格式
         if target_addr & 0xb4ff000000000000 == 0xb400000000000000:
             target_addr = target_addr & 0xffffffffffffff
-        
+
         seg = self.find_segment_by_address(target_addr)
         if not seg:
             print(f"[+] {target_addr} do not contain the addr")
             return
-        
+
         # 计算转储范围
         if range_size < 0x10000:
             dump_base = target_addr & (~(0x1000 - 1))
@@ -956,34 +974,42 @@ class IDAArm64Emulator(Arm64Emulator):
 
         seg_start = seg.start_ea
         seg_end = seg.end_ea
-        seg_name = ida_segment.get_segm_name(seg)
-        
+        # 过滤windows非法字符
+        def _safe_filename_part(name: str, max_len: int = 60) -> str:
+            """把段名转成 Windows 合法文件名片段。"""
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name or "")
+            name = name.strip(' .') or "unnamed"
+            return name[:max_len]
+
+        seg_name = ida_segment.get_segm_name(seg) or ""
+        seg_name = _safe_filename_part(seg_name)
+
         print(f"[+] Found segment: {seg_name}")
         print(f"[+] Segment range: {hex(seg_start)} - {hex(seg_end)}")
         print(f"[+] Segment size: {hex(seg_end - seg_start)} bytes")
-        
+
         dump_end = dump_base + range_size
         if dump_end > seg_end:
             dump_end = seg_end
         if dump_base < seg_start:
             dump_base = seg_start
-        
+
         # 检查是否已转储
         for exist_start, exist_end in self.dumped_range:
-            if dump_base > exist_start and dump_base < exist_end:
+            if exist_start < dump_base < exist_end:
                 dump_base = exist_end
-            if dump_end > exist_start and dump_end < exist_end:
+            if exist_start < dump_end < exist_end:
                 dump_end = exist_start
-        
+
         if dump_base >= dump_end:
             print(f"[+] Range {hex(dump_base)} - {hex(dump_end)} already dumped")
             return
-        
+
         self.dumped_range.append((dump_base, dump_end))
-        
+
         # 生成输出文件名
         filename = f"{file_dump_path}/segment_{seg_name}_{hex(dump_base)}_{hex(dump_end)}_{hex(dump_end - dump_base)}.bin"
-        
+
         # 转储段到文件
         self.dump_segment_to_file(dump_base, dump_end, filename)
 
@@ -996,33 +1022,31 @@ class IDAArm64Emulator(Arm64Emulator):
                 if not tmp_seg:
                     print(f"[+] {target_addr} do not contain the addr")
                     return
-
                 tmp_addr += tmp_seg.end_ea - tmp_seg.start_ea
 
-
-    def dump_registers_memory(self):    
+    def dump_registers_memory(self):
         """转储寄存器指向的内存，包括当前指令可能访问的内存地址"""
         try:
             # 获取当前PC
             current_pc = self.mu.reg_read(self.REG_MAP["pc"])
-            
+
             # 获取前一条指令的地址（因为当前PC可能已经指向下一条指令）
             prev_inst_addr = current_pc
-            
+
             try:
                 # 读取指令
                 code = self.mu.mem_read(prev_inst_addr, 4)
                 # 反汇编指令
                 insn = next(self.md.disasm(code, prev_inst_addr), None)
-                
+
                 if insn:
                     # 检查是否是内存加载指令
                     if any(insn.mnemonic.startswith(prefix) for prefix in self.READ_INSTRUCTIONS):
                         self.log(f"[+] 分析内存加载指令: {insn.mnemonic} {insn.op_str}")
-                        
+
                         # 分析内存操作数
                         memory_addresses = self._analyze_memory_operands_for_dump(insn)
-                        
+
                         if memory_addresses:
                             for addr in memory_addresses:
                                 self.log(f"[+] 需要dump的内存地址: {hex(addr)}")
@@ -1032,10 +1056,10 @@ class IDAArm64Emulator(Arm64Emulator):
                             self.log("[!] 无法解析内存地址")
             except Exception as e:
                 self.log(f"[!] 分析指令时出错: {e}")
-            
+
         except Exception as e:
             self.log(f"[!] 获取当前PC时出错: {e}")
-        
+
         # 同时转储所有寄存器指向的内存（原有逻辑）
         for reg_name in self.REG_MAP.keys():
             if "w" in reg_name or "tpidr" in reg_name:
@@ -1049,14 +1073,14 @@ class IDAArm64Emulator(Arm64Emulator):
     def _analyze_memory_operands_for_dump(self, insn):
         """专门用于dump的内存操作数分析"""
         memory_addresses = []
-        
+
         for op in insn.operands:
             if op.type == capstone.CS_OP_MEM:
                 mem = op.value.mem
                 base_reg = insn.reg_name(mem.base) if mem.base != 0 else None
                 index_reg = insn.reg_name(mem.index) if mem.index != 0 else None
                 disp = mem.disp
-                
+
                 try:
                     # 获取基址寄存器的值
                     base_val = 0
@@ -1070,7 +1094,7 @@ class IDAArm64Emulator(Arm64Emulator):
                             else:
                                 self.log(f"[!] 未知基址寄存器: {base_reg}")
                                 continue
-                    
+
                     # 获取索引寄存器的值
                     index_val = 0
                     if index_reg:
@@ -1082,7 +1106,7 @@ class IDAArm64Emulator(Arm64Emulator):
                             else:
                                 self.log(f"[!] 未知索引寄存器: {index_reg}")
                                 continue
-                    
+
                     # 计算内存地址
                     mem_addr = base_val
                     if index_reg:
@@ -1093,9 +1117,9 @@ class IDAArm64Emulator(Arm64Emulator):
                             mem_addr += index_val
                     mem_addr += disp
                     mem_addr = mem_addr & 0xFFFFFFFFFFFFFFFF
-                    
+
                     memory_addresses.append(mem_addr)
-                    
+
                     # 记录详细日志
                     self.log(f"  - 内存访问: {insn.mnemonic}")
                     # self.log(f"    基址寄存器: {base_reg} = {hex(base_val)}")
@@ -1104,11 +1128,11 @@ class IDAArm64Emulator(Arm64Emulator):
                     # if disp != 0:
                     #     self.log(f"    偏移量: {hex(disp)}")
                     self.log(f"    计算地址: {hex(mem_addr)}")
-                    
+
                 except Exception as e:
                     self.log(f"[!] 计算内存地址时出错: {e}")
                     self.log(f"    指令: {insn.mnemonic} {insn.op_str}")
-        
+
         return memory_addresses
 
     def check_registers(self):
@@ -1126,7 +1150,7 @@ class IDAArm64Emulator(Arm64Emulator):
                 ida_value = ida_value & 0xffffffffffffff
             print(f"{reg_name} uc: 0x{uc_value:x} ida: 0x{ida_value:x}")
             if uc_value != ida_value:
-                return True 
+                return True
         return False
 
     def _collect_register_state(self):
@@ -1134,7 +1158,7 @@ class IDAArm64Emulator(Arm64Emulator):
         registers = {}
         registers["sp"] = hex(idc.get_reg_value("sp"))
         registers["pc"] = hex(idc.get_reg_value("pc"))
-        
+
         for i in range(31):
             reg_value = idc.get_reg_value(f"x{i}")
             # 处理特殊地址格式
@@ -1142,29 +1166,33 @@ class IDAArm64Emulator(Arm64Emulator):
                 reg_value = reg_value & 0xffffffffffffff
             print(f"x{i} = " + hex(reg_value))
             registers[f"x{i}"] = hex(reg_value)
-                
+
         return registers
 
-# endaddr_input
-# tpidr_value_input
-# enable_tenet
-# user_path
-# end_addr_absolute
-# use_custom_bound
-# bound_start
-# bound_end
 
 def uni_trace_main(
-    endaddr_input:int,
-    tpidr_value_input: int = None,
-    enable_tenet=False,
-    user_path:str = ".",
-    end_addr_absolute: bool = False,
-    use_custom_bound: bool = False,
-    bound_start: int = None,
-    bound_end: int = None,
+        base_addr: int,
+        endaddr_input: int,
+        tpidr_value_input: int = None,
+        enable_tenet=False,
+        user_path: str = ".",
+        end_addr_absolute: bool = False,
+        use_custom_bound: bool = False,
+        bound_start: int = None,
+        bound_end: int = None,
 ):
-    """主函数 - 集成原有脚本的main函数功能"""
+    """执行 Unicorn 指令追踪主流程。
+       Args:
+           base_addr: 基地址
+           endaddr_input: 追踪结束地址。
+           tpidr_value_input: TPIDR 寄存器的初始值，默认 None。
+           enable_tenet: 是否启用 Tenet 可视化，默认 False。
+           user_path: 追踪结果（trace）的保存路径，默认当前目录 "."。
+           end_addr_absolute: endaddr_input 是否为绝对地址，默认 False。
+           use_custom_bound: 是否使用自定义地址区间，默认 False。
+           bound_start: 自定义区间起始地址，仅 use_custom_bound=True 时生效。
+           bound_end: 自定义区间结束地址，仅 use_custom_bound=True 时生效。
+       """
     total_log_path = os.path.join(user_path, f"uc_combine_{str(int(time.time()))}.log")
     tenet_combine_path = None
     tenet_total_log = None
@@ -1187,8 +1215,8 @@ def uni_trace_main(
 
         # 收集寄存器状态
         registers = emulator._collect_register_state()
-        
-        emulator.BASE = idaapi.get_imagebase()
+
+        emulator.BASE = base_addr
         auto_start, auto_end = _collect_auto_range(verbose=True)
         emulator.END = auto_end
         auto_range = (auto_start, auto_end)
@@ -1205,13 +1233,13 @@ def uni_trace_main(
         print(f"[+] Auto Range = {hex(auto_range[0])} - {hex(auto_range[1])}")
         print(f"[+] Run Range  = {hex(emulator.run_range[0])} - {hex(emulator.run_range[1])}")
         print("[+] DUMPING memory")
-        
+
         # 转储寄存器指向的内存
         for reg_value in registers.values():
             if isinstance(reg_value, str):
                 reg_value = int(reg_value, 16)
             emulator.dump_single_segment_address(reg_value, DUMP_SINGLE_SEG_SIZE, emulator.dump_path, True)
-        
+
         # 保存寄存器状态
         if tpidr_value_input != None:
             registers["tpidr"] = hex(tpidr_value_input)
@@ -1241,7 +1269,7 @@ def uni_trace_main(
 
         emulator.tpidr_value = tpidr_value_input
         result_code = 11400
-        
+
         if enable_tenet:
             _tenet_log_path = f"{emulator.dump_path}/tenet.log"
         else:
@@ -1249,10 +1277,10 @@ def uni_trace_main(
 
         # 执行模拟
         while result_code != 114514:
-            result_code = emulator.main_trace(end_addr, 
-                                        user_log_path=f"{emulator.dump_path}/uc.log", 
-                                        tenet_log_path=_tenet_log_path,
-                                        load_dumps_path=emulator.dump_path)
+            result_code = emulator.main_trace(end_addr,
+                                              user_log_path=f"{emulator.dump_path}/uc.log",
+                                              tenet_log_path=_tenet_log_path,
+                                              load_dumps_path=emulator.dump_path)
             if result_code == 2:
                 print("Update Memory")
                 emulator.dump_registers_memory()
@@ -1279,7 +1307,7 @@ def uni_trace_main(
         if result_code == 1:
             print("[+] restart ")
             continue
-        
+
         if result_code == 0:
             print("[!] Something Wrong")
             break
