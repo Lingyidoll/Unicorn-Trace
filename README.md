@@ -90,6 +90,19 @@ Under `Output path`:
 - `dump_<timestamp>/tenet.log` (when Tenet enabled)
 - `tenet_combine_<timestamp>.log` (when Tenet enabled)
 
+`uc.log` is a per-instruction human-readable log with fixed-width, aligned columns (time / PC / offset from base / instruction bytes / disassembly / registers before => registers after):
+
+```text
+[00:16:29 138]  [0x737c3978cc]  [0x0148cc]  [fc6fbaa9]  "stp x28, x27, [sp, #-0x60]!"       x28=0x765d2b2640 x27=0x74b683a470 sp=0x7fcd7f6130 => sp=0x7fcd7f60d0
+[00:16:29 138]  [0x737c3978d0]  [0x0148d0]  [fd430191]  "add x29, sp, #0x50"                sp=0x7fcd7f60d0 => x29=0x7fcd7f6120
+[00:16:29 138]  [0x737c3978d4]  [0x0148d4]  [ff8327d1]  "sub sp, sp, #0x9e0"                sp=0x7fcd7f60d0 => sp=0x7fcd7f56f0
+[00:16:29 138]  [0x737c3978dc]  [0x0148dc]  [82008052]  "mov w2, #4"                        w2=0x21c0228 => w2=0x4
+```
+
+- PC / offset column widths are derived from the trace address range so the disassembly and register columns always start at the same position. Tunable via `TRACE_MIN_PC_WIDTH`, `TRACE_MIN_OFFSET_WIDTH`, `TRACE_INSN_WIDTH`, `TRACE_COL_GAP`.
+- Instructions without read registers show the old value of the overwritten register; `=>` is omitted when nothing is written.
+- Flag-related instructions (`cmp`, conditional branches, ...) show `nzcv: N=.., Z=.., C=.., V=..`.
+
 ## Offline Replay
 
 Use `local_emu.py` for replaying dumped data.

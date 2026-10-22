@@ -2,7 +2,9 @@ import time
 import json
 import re
 import os
+from datetime import datetime
 import capstone
+import unicorn.arm64_const as arm64_const
 from unicorn import *
 from unicorn.arm64_const import *
 import ida_segment
@@ -33,6 +35,17 @@ BASE = 0
 tpidr_value = None
 last_regs = None
 run_range = (0, 0)
+pending_trace_entry = None
+trace_layout_cache = None
+
+# uc.log 列宽配置：PC/偏移列宽会按本次 trace 的地址范围自动放大
+TRACE_MIN_PC_WIDTH = 8
+TRACE_MIN_OFFSET_WIDTH = 6
+TRACE_INSN_WIDTH = 36
+TRACE_COL_GAP = "  "
+
+# 别名寄存器 -> 指令中常见的规范名
+REG_ALIAS = {"fp": "x29", "lr": "x30"}
 
 # ==============================
 # 寄存器映射
@@ -364,19 +377,231 @@ def tenet_trace_log(address):
         trace_log.write(tmp_buffer + output_line + "\n")
 
 def print_user_log(address):
-    """用户日志记录"""
-    offset = address - BASE
-    code = mu.mem_read(address, 4)
-    
-    md.detail = True
-    insn = next(md.disasm(code, address), None)
-    
-    if not insn:
-        print(f"{hex(address):<12}: <Unknown Coding>", file=log_file)
+    """记录当前指令的寄存器快照。
+
+    真正的日志行会延后到下一条指令触发（或 trace 结束）时输出，
+    这样 "=>" 后面读到的就是本条指令执行完成后的寄存器值。
+    """
+    global pending_trace_entry
+    if not log_file:
         return
 
-    content = _format_instruction_operands(insn)
-    print(f"{hex(address):<12}: {insn.mnemonic:<8} {insn.op_str:<24} {content:<50}", file=log_file)
+    entry = {
+        "address": address,
+        "code": b"",
+        "mnemonic": None,
+        "op_str": "",
+        "reads": [],
+        "before_regs": [],
+        "writes": [],
+        "before": {},
+    }
+
+    try:
+        code = bytes(mu.mem_read(address, 4))
+    except Exception:
+        code = b""
+    entry["code"] = code
+
+    insn = None
+    if code:
+        try:
+            insn = next(md.disasm(code, address), None)
+        except Exception:
+            insn = None
+
+    if insn is not None:
+        entry["mnemonic"] = insn.mnemonic
+        entry["op_str"] = insn.op_str
+        reads, writes = _instruction_reg_access(insn)
+        entry["reads"] = reads
+        entry["writes"] = writes
+        # 执行前：记录本条指令读取的寄存器
+        before_regs = list(reads)
+        for reg in reads:
+            entry["before"][reg] = _read_reg_value(reg)
+        # 没有读取寄存器时，记录被覆盖寄存器的旧值（便于看出指令效果）
+        if not before_regs:
+            for reg in writes:
+                if reg in ("nzcv", "wzr", "xzr"):
+                    continue
+                before_regs.append(reg)
+                entry["before"][reg] = _read_reg_value(reg)
+        entry["before_regs"] = before_regs
+
+    pending_trace_entry = entry
+
+
+def flush_trace_log():
+    """输出上一条已执行指令的日志行"""
+    global pending_trace_entry
+    entry = pending_trace_entry
+    pending_trace_entry = None
+    if entry is None or not log_file:
+        return
+    try:
+        print(_build_trace_line(entry), file=log_file)
+    except Exception:
+        pass
+
+
+def _build_trace_line(entry):
+    """生成一行日志（各列定宽对齐）：
+
+    [时间]  [PC]  [偏移]  [指令字节]  "指令"  操作数寄存器 => 结果寄存器/nzcv
+    """
+    gap = TRACE_COL_GAP
+    pc_width, off_width = _trace_layout()
+    now = datetime.now()
+    address = entry["address"]
+    offset = address - BASE
+    if offset < 0:
+        offset_str = f"-0x{-offset:0{max(off_width - 1, 1)}x}"
+    else:
+        offset_str = f"0x{offset:0{off_width}x}"
+
+    header = (f"[{now.hour:02d}:{now.minute:02d}:{now.second:02d} "
+              f"{now.microsecond // 1000:03d}]{gap}"
+              f"[0x{address:0{pc_width}x}]{gap}"
+              f"[{offset_str}]{gap}"
+              f"[{entry['code'].hex()}]{gap}")
+
+    if entry["mnemonic"] is None:
+        return f"{header}<Unknown Coding>"
+
+    insn_text = entry["mnemonic"]
+    if entry["op_str"]:
+        insn_text += " " + entry["op_str"]
+    insn_col = f'"{insn_text}"'
+    line = header + insn_col.ljust(max(TRACE_INSN_WIDTH, len(insn_col) + 1))
+
+    before = _format_trace_regs(entry["before_regs"], entry["before"])
+    after_values = {reg: _read_reg_value(reg) for reg in entry["writes"]}
+    after = _format_trace_regs(
+        [reg for reg in entry["writes"] if reg not in ("wzr", "xzr")],
+        after_values
+    )
+
+    if before:
+        line += before
+    if after:
+        line += f" => {after}" if before else after
+    return line.rstrip()
+
+
+def _trace_layout():
+    """按本次 trace 的地址范围计算列宽，保证指令起始列对齐"""
+    global trace_layout_cache
+    if trace_layout_cache is not None:
+        return trace_layout_cache
+
+    pc_width = TRACE_MIN_PC_WIDTH
+    off_width = TRACE_MIN_OFFSET_WIDTH
+    try:
+        start, end = run_range
+        hi = max(start, end)
+        if hi > 0:
+            pc_width = max(pc_width, len(f"{hi:x}"))
+            if start >= BASE and hi > BASE:
+                off_width = max(off_width, len(f"{hi - BASE:x}"))
+    except Exception:
+        pass
+
+    trace_layout_cache = (pc_width, off_width)
+    return trace_layout_cache
+
+
+def _format_trace_regs(regs, values):
+    """格式化为 w9=0xaa2b / nzcv: N=0, Z=1, C=1, V=0"""
+    parts = []
+    for reg in regs:
+        value = values.get(reg)
+        if reg == "nzcv":
+            parts.append(_format_nzcv(value))
+        elif value is None:
+            parts.append(f"{reg}=?")
+        else:
+            parts.append(f"{reg}=0x{value:x}")
+    return " ".join(parts)
+
+
+def _format_nzcv(value):
+    if value is None:
+        return "nzcv=?"
+    return "nzcv: N=%d, Z=%d, C=%d, V=%d" % (
+        (value >> 31) & 1, (value >> 30) & 1, (value >> 29) & 1, (value >> 28) & 1)
+
+
+def _read_reg_value(reg_name):
+    """读取寄存器值，无法读取时返回 None"""
+    if reg_name in ("wzr", "xzr"):
+        return 0
+    reg_id = REG_MAP.get(reg_name)
+    if reg_id is None:
+        reg_id = getattr(arm64_const, "UC_ARM64_REG_" + reg_name.upper(), None)
+    if reg_id is None:
+        return None
+    try:
+        return mu.reg_read(reg_id)
+    except UcError:
+        return None
+
+
+def _instruction_reg_access(insn):
+    """获取指令读/写的寄存器名（capstone 不可用时退化为操作数推断）"""
+    try:
+        read_ids, write_ids = insn.regs_access()
+        reads = [insn.reg_name(reg) for reg in read_ids]
+        writes = [insn.reg_name(reg) for reg in write_ids]
+    except Exception:
+        reads, writes = _fallback_reg_access(insn)
+
+    reads = [REG_ALIAS.get(reg, reg) for reg in reads]
+    writes = [REG_ALIAS.get(reg, reg) for reg in writes]
+
+    # capstone 未把 ret 的隐式 lr 计入读取集合
+    if insn.mnemonic.startswith("ret") and not reads:
+        reads.append("x30")
+
+    return _dedup(reads), _dedup(writes)
+
+
+def _dedup(items):
+    seen = set()
+    result = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _fallback_reg_access(insn):
+    """capstone 无法给出读写集合时，按操作数位置做保守推断"""
+    reads, writes = [], []
+    if not insn.operands:
+        return reads, writes
+
+    no_dest_prefixes = (
+        "str", "st", "cmp", "cmn", "tst", "tbz", "tbnz",
+        "b", "cbz", "cbnz", "ret", "nop",
+    )
+    base = insn.mnemonic.split('.')[0]
+    has_dest = not base.startswith(no_dest_prefixes)
+
+    for index, op in enumerate(insn.operands):
+        if op.type == capstone.CS_OP_REG:
+            reg = insn.reg_name(op.value.reg)
+            reads.append(reg)
+            if index == 0 and has_dest:
+                writes.append(reg)
+        elif op.type == capstone.CS_OP_MEM:
+            mem = op.value.mem
+            if mem.base != 0:
+                reads.append(insn.reg_name(mem.base))
+            if mem.index != 0:
+                reads.append(insn.reg_name(mem.index))
+    return reads, writes
 
 def _format_instruction_operands(insn):
     """格式化指令操作数"""
@@ -433,6 +658,9 @@ def _format_instruction_operands(insn):
 def debug_hook_code(uc, address, size, user_data):
     """调试钩子，用于其他调试目的"""
     global log_file, trace_log, run_range
+
+    # 先输出上一条指令的日志：此时寄存器已是上一条指令执行后的状态
+    flush_trace_log()
 
     # 检查执行范围
     if address <= run_range[0] or address >= run_range[1]:
@@ -509,10 +737,15 @@ def dump_memory(filename, address, size):
 def main_trace(so_name, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps"):
     """主要模拟函数"""
     global trace_log, log_file, mu, last_registers, tpidr_value, last_regs, hooks
+    global pending_trace_entry, trace_layout_cache
     
     try:        
         # 初始化模拟器
         mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+
+        # 新一轮 trace，丢弃上一轮残留的待输出指令
+        pending_trace_entry = None
+        trace_layout_cache = None
         
         # 初始化日志文件
         trace_log, log_file = _init_log_files(tenet_log_path, user_log_path)
@@ -550,6 +783,8 @@ def main_trace(so_name, end_addr, tenet_log_path=None, user_log_path="./uc.log",
         return 0
     finally:
         print(f"Trace END!")
+        # 输出最后一条指令（此时已没有下一条指令来触发 flush）
+        flush_trace_log()
         # 清理资源
         if log_file:
             log_file.close()

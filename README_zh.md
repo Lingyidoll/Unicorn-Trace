@@ -90,6 +90,19 @@ dyn_trace_ida.uni_trace_main(
 - `dump_<timestamp>/tenet.log`（开启 Tenet 时）
 - `tenet_combine_<timestamp>.log`（开启 Tenet 时）
 
+`uc.log` 为逐指令人类可读日志，各列定宽对齐（时间 / PC / 相对基址偏移 / 指令字节 / 反汇编 / 执行前寄存器 => 执行后寄存器）：
+
+```text
+[00:16:29 138]  [0x737c3978cc]  [0x0148cc]  [fc6fbaa9]  "stp x28, x27, [sp, #-0x60]!"       x28=0x765d2b2640 x27=0x74b683a470 sp=0x7fcd7f6130 => sp=0x7fcd7f60d0
+[00:16:29 138]  [0x737c3978d0]  [0x0148d0]  [fd430191]  "add x29, sp, #0x50"                sp=0x7fcd7f60d0 => x29=0x7fcd7f6120
+[00:16:29 138]  [0x737c3978d4]  [0x0148d4]  [ff8327d1]  "sub sp, sp, #0x9e0"                sp=0x7fcd7f60d0 => sp=0x7fcd7f56f0
+[00:16:29 138]  [0x737c3978dc]  [0x0148dc]  [82008052]  "mov w2, #4"                        w2=0x21c0228 => w2=0x4
+```
+
+- PC / 偏移列宽按本次 trace 的地址范围自动计算，反汇编列与寄存器列固定起始列；可调参数：`TRACE_MIN_PC_WIDTH`、`TRACE_MIN_OFFSET_WIDTH`、`TRACE_INSN_WIDTH`、`TRACE_COL_GAP`。
+- 无读取寄存器的指令会显示被覆盖寄存器的旧值；无写入寄存器时省略 `=>`。
+- 条件跳转、`cmp` 等涉及标志位的指令会以 `nzcv: N=.., Z=.., C=.., V=..` 展示。
+
 ## 离线回放
 
 `local_emu.py` 常用入口：

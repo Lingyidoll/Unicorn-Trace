@@ -1,7 +1,9 @@
 import json
 import re
 import os
+from datetime import datetime
 import capstone
+import unicorn.arm64_const as arm64_const
 from unicorn import *
 from unicorn.arm64_const import *
 
@@ -31,10 +33,14 @@ class Arm64Emulator:
         "w28": UC_ARM64_REG_W28, "w29": UC_ARM64_REG_W29, "w30": UC_ARM64_REG_W30,
         
         # Special registers
-        "pc": UC_ARM64_REG_PC, "sp": UC_ARM64_REG_SP, "fp": UC_ARM64_REG_X29, "lr": UC_ARM64_REG_X30,
+        "pc": UC_ARM64_REG_PC, "sp": UC_ARM64_REG_SP, "wsp": UC_ARM64_REG_WSP,
+        "fp": UC_ARM64_REG_X29, "lr": UC_ARM64_REG_X30,
 
         "tpidr": UC_ARM64_REG_TPIDR_EL0
     }
+
+    # 别名寄存器 -> 指令中常见的规范名
+    REG_ALIAS = {"fp": "x29", "lr": "x30"}
     
     # 内存访问指令常量
     READ_INSTRUCTIONS = ['ldr', 'ldrb', 'ldrh', 'ldp', 'ldur', 'ldurb', 'ldurh', 'ldxr', 'ldar']
@@ -48,6 +54,12 @@ class Arm64Emulator:
         "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29",
         "x30", "sp", "pc"
     ]
+
+    # uc.log 列宽配置：PC/偏移列宽会按本次 trace 的地址范围自动放大
+    TRACE_MIN_PC_WIDTH = 8       # PC 十六进制位数下限
+    TRACE_MIN_OFFSET_WIDTH = 6   # 偏移十六进制位数下限
+    TRACE_INSN_WIDTH = 36        # 反汇编列宽，寄存器信息从这一列开始
+    TRACE_COL_GAP = "  "         # 各列之间的间隔
 
     def __init__(self, heap_base=0x1000000, heap_size=0x90000):
         """初始化模拟器"""
@@ -75,6 +87,10 @@ class Arm64Emulator:
         self.loaded_files = []
         self.map_range = []
         self.debug = True
+
+        # 用户日志（uc.log）逐指令记录，延后一条指令输出，以拿到执行后的寄存器值
+        self._pending_trace_entry = None
+        self._trace_layout_cache = None
 
     def log(self, *args, **kwargs):
         """根据 debug 开关打印信息"""
@@ -321,19 +337,227 @@ class Arm64Emulator:
             self.trace_log.write(tmp_buffer + output_line + "\n")
 
     def print_user_log(self, address):
-        """用户日志记录"""
-        offset = address - self.BASE
-        code = self.mu.mem_read(address, 4)
-        
-        self.md.detail = True
-        insn = next(self.md.disasm(code, address), None)
-        
-        if not insn:
-            print(f"{hex(address):<12}: <Unknown Coding>", file=self.log_file)
+        """记录当前指令的寄存器快照。
+
+        真正的日志行会延后到下一条指令触发（或 trace 结束）时输出，
+        这样 "=>" 后面读到的就是本条指令执行完成后的寄存器值。
+        """
+        if not self.log_file:
             return
 
-        content = self._format_instruction_operands(insn)
-        print(f"{hex(address):<12}: {insn.mnemonic:<8} {insn.op_str:<24} {content:<50}", file=self.log_file)
+        entry = {
+            "address": address,
+            "code": b"",
+            "mnemonic": None,
+            "op_str": "",
+            "reads": [],
+            "before_regs": [],
+            "writes": [],
+            "before": {},
+        }
+
+        try:
+            code = bytes(self.mu.mem_read(address, 4))
+        except Exception:
+            code = b""
+        entry["code"] = code
+
+        insn = None
+        if code:
+            try:
+                insn = next(self.md.disasm(code, address), None)
+            except Exception:
+                insn = None
+
+        if insn is not None:
+            entry["mnemonic"] = insn.mnemonic
+            entry["op_str"] = insn.op_str
+            reads, writes = self._instruction_reg_access(insn)
+            entry["reads"] = reads
+            entry["writes"] = writes
+            # 执行前：记录本条指令读取的寄存器
+            before_regs = list(reads)
+            for reg in reads:
+                entry["before"][reg] = self._read_reg_value(reg)
+            # 没有读取寄存器时，记录被覆盖寄存器的旧值（便于看出指令效果）
+            if not before_regs:
+                for reg in writes:
+                    if reg in ("nzcv", "wzr", "xzr"):
+                        continue
+                    before_regs.append(reg)
+                    entry["before"][reg] = self._read_reg_value(reg)
+            entry["before_regs"] = before_regs
+
+        self._pending_trace_entry = entry
+
+    def flush_trace_log(self):
+        """输出上一条已执行指令的日志行"""
+        entry = self._pending_trace_entry
+        self._pending_trace_entry = None
+        if entry is None or not self.log_file:
+            return
+        try:
+            print(self._build_trace_line(entry), file=self.log_file)
+        except Exception:
+            pass
+
+    def _build_trace_line(self, entry):
+        """生成一行日志（各列定宽对齐）：
+
+        [时间]  [PC]  [偏移]  [指令字节]  "指令"  操作数寄存器 => 结果寄存器/nzcv
+        """
+        gap = self.TRACE_COL_GAP
+        pc_width, off_width = self._trace_layout()
+        now = datetime.now()
+        address = entry["address"]
+        offset = address - self.BASE
+        if offset < 0:
+            offset_str = f"-0x{-offset:0{max(off_width - 1, 1)}x}"
+        else:
+            offset_str = f"0x{offset:0{off_width}x}"
+
+        header = (f"[{now.hour:02d}:{now.minute:02d}:{now.second:02d} "
+                  f"{now.microsecond // 1000:03d}]{gap}"
+                  f"[0x{address:0{pc_width}x}]{gap}"
+                  f"[{offset_str}]{gap}"
+                  f"[{entry['code'].hex()}]{gap}")
+
+        if entry["mnemonic"] is None:
+            return f"{header}<Unknown Coding>"
+
+        insn_text = entry["mnemonic"]
+        if entry["op_str"]:
+            insn_text += " " + entry["op_str"]
+        insn_col = f'"{insn_text}"'
+        line = header + insn_col.ljust(max(self.TRACE_INSN_WIDTH, len(insn_col) + 1))
+
+        before = self._format_trace_regs(entry["before_regs"], entry["before"])
+        after_values = {reg: self._read_reg_value(reg) for reg in entry["writes"]}
+        after = self._format_trace_regs(
+            [reg for reg in entry["writes"] if reg not in ("wzr", "xzr")],
+            after_values
+        )
+
+        if before:
+            line += before
+        if after:
+            line += f" => {after}" if before else after
+        return line.rstrip()
+
+    def _trace_layout(self):
+        """按本次 trace 的地址范围计算列宽，保证指令起始列对齐"""
+        if self._trace_layout_cache is not None:
+            return self._trace_layout_cache
+
+        pc_width = self.TRACE_MIN_PC_WIDTH
+        off_width = self.TRACE_MIN_OFFSET_WIDTH
+        try:
+            start, end = self.run_range
+            hi = max(start, end)
+            if hi > 0:
+                pc_width = max(pc_width, len(f"{hi:x}"))
+                if start >= self.BASE and hi > self.BASE:
+                    off_width = max(off_width, len(f"{hi - self.BASE:x}"))
+        except Exception:
+            pass
+
+        self._trace_layout_cache = (pc_width, off_width)
+        return self._trace_layout_cache
+
+    def _format_trace_regs(self, regs, values):
+        """格式化为 w9=0xaa2b / nzcv: N=0, Z=1, C=1, V=0"""
+        parts = []
+        for reg in regs:
+            value = values.get(reg)
+            if reg == "nzcv":
+                parts.append(self._format_nzcv(value))
+            elif value is None:
+                parts.append(f"{reg}=?")
+            else:
+                parts.append(f"{reg}=0x{value:x}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _format_nzcv(value):
+        if value is None:
+            return "nzcv=?"
+        return "nzcv: N=%d, Z=%d, C=%d, V=%d" % (
+            (value >> 31) & 1, (value >> 30) & 1, (value >> 29) & 1, (value >> 28) & 1)
+
+    def _read_reg_value(self, reg_name):
+        """读取寄存器值，无法读取时返回 None"""
+        if reg_name in ("wzr", "xzr"):
+            return 0
+        if reg_name == "nzcv":
+            try:
+                return self.mu.reg_read(UC_ARM64_REG_NZCV)
+            except UcError:
+                return None
+        reg_id = self.REG_MAP.get(reg_name)
+        if reg_id is None:
+            reg_id = getattr(arm64_const, "UC_ARM64_REG_" + reg_name.upper(), None)
+        if reg_id is None:
+            return None
+        try:
+            return self.mu.reg_read(reg_id)
+        except UcError:
+            return None
+
+    def _instruction_reg_access(self, insn):
+        """获取指令读/写的寄存器名（capstone 不可用时退化为操作数推断）"""
+        try:
+            read_ids, write_ids = insn.regs_access()
+            reads = [insn.reg_name(reg) for reg in read_ids]
+            writes = [insn.reg_name(reg) for reg in write_ids]
+        except Exception:
+            reads, writes = self._fallback_reg_access(insn)
+
+        reads = [self.REG_ALIAS.get(reg, reg) for reg in reads]
+        writes = [self.REG_ALIAS.get(reg, reg) for reg in writes]
+
+        # capstone 未把 ret 的隐式 lr 计入读取集合
+        if insn.mnemonic.startswith("ret") and not reads:
+            reads.append("x30")
+
+        return self._dedup(reads), self._dedup(writes)
+
+    @staticmethod
+    def _dedup(items):
+        seen = set()
+        result = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+    @staticmethod
+    def _fallback_reg_access(insn):
+        """capstone 无法给出读写集合时，按操作数位置做保守推断"""
+        reads, writes = [], []
+        if not insn.operands:
+            return reads, writes
+
+        no_dest_prefixes = (
+            "str", "st", "cmp", "cmn", "tst", "tbz", "tbnz",
+            "b", "cbz", "cbnz", "ret", "nop",
+        )
+        base = insn.mnemonic.split('.')[0]
+        has_dest = not base.startswith(no_dest_prefixes)
+
+        for index, op in enumerate(insn.operands):
+            if op.type == capstone.CS_OP_REG:
+                reg = insn.reg_name(op.value.reg)
+                reads.append(reg)
+                if index == 0 and has_dest:
+                    writes.append(reg)
+            elif op.type == capstone.CS_OP_MEM:
+                mem = op.value.mem
+                if mem.base != 0:
+                    reads.append(insn.reg_name(mem.base))
+                if mem.index != 0:
+                    reads.append(insn.reg_name(mem.index))
+        return reads, writes
 
     def _format_instruction_operands(self, insn):
         """格式化指令操作数"""
@@ -389,6 +613,9 @@ class Arm64Emulator:
 
     def debug_hook_code(self, uc, address, size, user_data):
         """调试钩子，用于其他调试目的"""
+        # 先输出上一条指令的日志：此时寄存器已是上一条指令执行后的状态
+        self.flush_trace_log()
+
         # 检查执行范围
         if address <= self.run_range[0] or address >= self.run_range[1]:
             self.log("OUT OF RANGE")
@@ -467,6 +694,10 @@ class Arm64Emulator:
 
     def init_log_files(self, tenet_log_path, user_log_path):
         """初始化日志文件"""
+        # 新一轮 trace，丢弃上一轮残留的待输出指令
+        self._pending_trace_entry = None
+        self._trace_layout_cache = None
+
         if tenet_log_path:
             self.trace_log = open(tenet_log_path, "w")
         
@@ -622,6 +853,8 @@ class Arm64Emulator:
             self.my_reg_logger()
         finally:
             self.my_reg_logger()
+            # 输出最后一条指令（此时已没有下一条指令来触发 flush）
+            self.flush_trace_log()
             # 记录最终寄存器状态
             if self.trace_log:
                 self._write_final_registers()
@@ -650,6 +883,7 @@ class Arm64Emulator:
 
     def cleanup(self):
         """清理资源"""
+        self.flush_trace_log()
         if self.log_file:
             self.log_file.close()
             self.log_file = None

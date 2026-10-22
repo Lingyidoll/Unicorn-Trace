@@ -629,6 +629,10 @@ class IDAArm64Emulator(Arm64Emulator):
 
     def init_log_files(self, tenet_log_path, user_log_path):
         """初始化日志文件"""
+        # 新一轮 trace，丢弃上一轮残留的待输出指令
+        self._pending_trace_entry = None
+        self._trace_layout_cache = None
+
         if tenet_log_path:
             # self.remove_last_line_efficient(tenet_log_path)
             self.trace_log = open(tenet_log_path, "a")
@@ -821,6 +825,8 @@ class IDAArm64Emulator(Arm64Emulator):
             return 0
         finally:
             print(f"Trace END!")
+            # 输出最后一条指令（此时已没有下一条指令来触发 flush）
+            self.flush_trace_log()
             # 清理资源
             if self.log_file:
                 self.log_file.close()
