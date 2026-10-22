@@ -658,44 +658,6 @@ class IDAArm64Emulator(Arm64Emulator):
         self.run_range = (0, 0)
         self._tpidr_auto_detected = False
 
-    # ==============================
-    # 重写父类方法 - 主要模拟
-    # ==============================
-
-    def _check_mrs_tpidr(self, address):
-        """检测 mrs Xn, tpidr_el0 指令，通过IDA run_to执行后从目标寄存器读取tpidr值"""
-        code = bytes(self.mu.mem_read(address, 4))
-        if code[1] == 0xD0 and code[2] == 0x3B and code[3] == 0xD5 and (code[0] & 0xE0) == 0x40:
-            dest_reg = code[0] & 0x1F
-            print(f"[+] 自动检测到 mrs x{dest_reg}, tpidr_el0 @ 0x{address:x}")
-            try:
-                # run_to mrs指令位置，再步过到 PC+4，让真机执行 mrs
-                ida_dbg.run_to(address)
-                ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
-                ida_dbg.run_to(address + 4)
-                ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
-                # mrs 执行完毕，目标寄存器已有 tpidr 值
-                tpidr_val = idc.get_reg_value(f"x{dest_reg}")
-                tpidr_val = _normalize_dbg_addr(tpidr_val)
-            except Exception as e:
-                print(f"[!] 通过IDA执行mrs获取tpidr失败: {e}")
-                return
-            self.tpidr_value = tpidr_val
-            self._tpidr_auto_detected = True
-            self.mu.reg_write(UC_ARM64_REG_TPIDR_EL0, tpidr_val)
-            print(f"[+] 从IDA调试器获取 tpidr_el0 = 0x{tpidr_val:x}")
-            regs_path = os.path.join(self.dump_path, "regs.json")
-            if os.path.exists(regs_path):
-                try:
-                    with open(regs_path, "r", encoding="utf-8") as f:
-                        regs = json.load(f)
-                    regs["tpidr"] = hex(tpidr_val)
-                    with open(regs_path, "w", encoding="utf-8") as f:
-                        json.dump(regs, f)
-                    print(f"[+] 已将 tpidr 写入 {regs_path}")
-                except Exception as e:
-                    print(f"[!] 回写 tpidr 到 regs.json 失败: {e}")
-
     def debug_hook_code(self, uc, address, size, user_data):
         super().debug_hook_code(uc, address, size, user_data)
 
@@ -867,9 +829,10 @@ class IDAArm64Emulator(Arm64Emulator):
             exit(0)
         print(
             f"[+] Run to 0x{self.mu.reg_read(self.REG_MAP['lr']):x} for further run, PC: 0x{self.mu.reg_read(self.REG_MAP['pc']):x} ")
-        ida_dbg.run_to(self.mu.reg_read(self.REG_MAP['lr']))
-        print("[+] Waiting Ida...")
-        ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
+        lr_pc = self.mu.reg_read(self.REG_MAP['lr'])
+        ida_dbg.run_to(lr_pc)
+        print(f'[+] Waiting Ida... pc:{hex(lr_pc)}')
+        ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 7)
         print(f"[+] Restart this Script until finish")
         return 1
 
@@ -881,9 +844,10 @@ class IDAArm64Emulator(Arm64Emulator):
 
         print(
             f"[+] Run to 0x{self.mu.reg_read(self.REG_MAP['pc']) + 4:x} for further run, PC: 0x{self.mu.reg_read(self.REG_MAP['pc']):x} ")
-        ida_dbg.run_to(self.mu.reg_read(self.REG_MAP['pc']) + 4)
+        next_pc = self.mu.reg_read(self.REG_MAP['pc']) + 4
+        ida_dbg.run_to(next_pc)
         print("[+] Waiting Ida...")
-        ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
+        ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 7)
         print(f"[+] Restart this Script until finish")
         return 1
 
